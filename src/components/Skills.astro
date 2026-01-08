@@ -4,8 +4,6 @@ import SkillModal from "./SkillModal.astro";
 import { SITE_CONTENT } from "@config";
 
 const { categories, details } = SITE_CONTENT.skills;
-
-const getSkillDetail = (name: string) => details.find((d) => d.name === name);
 ---
 
 <Section text="Technical Expertise" href="skills">
