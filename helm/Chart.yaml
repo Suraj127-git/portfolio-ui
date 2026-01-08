@@ -1,0 +1,15 @@
+apiVersion: v2
+name: portfolio-ui
+description: A Helm chart for AstroZen Portfolio UI
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - portfolio
+  - astro
+  - frontend
+maintainers:
+  - name: Portfolio Team
+home: https://github.com/yourusername/portfolio-ui
+sources:
+  - https://github.com/yourusername/portfolio-ui

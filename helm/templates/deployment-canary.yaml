@@ -1,0 +1,56 @@
+{{- if .Values.deployment.canary.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "portfolio-ui.fullname" . }}-canary
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "portfolio-ui.labels" . | nindent 4 }}
+    app: portfolio-ui
+    version: canary
+spec:
+  replicas: {{ .Values.deployment.canary.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "portfolio-ui.selectorLabels" . | nindent 6 }}
+      app: portfolio-ui
+      version: canary
+  template:
+    metadata:
+      labels:
+        {{- include "portfolio-ui.selectorLabels" . | nindent 8 }}
+        app: portfolio-ui
+        version: canary
+    spec:
+      {{- include "portfolio-ui.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.deployment.securityContext | nindent 8 }}
+      containers:
+      - name: portfolio-ui
+        image: "{{ .Values.deployment.image.registry }}/{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+        imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.targetPort }}
+          protocol: TCP
+        livenessProbe:
+          {{- toYaml .Values.deployment.livenessProbe | nindent 10 }}
+        readinessProbe:
+          {{- toYaml .Values.deployment.readinessProbe | nindent 10 }}
+        resources:
+          {{- toYaml .Values.deployment.canary.resources | nindent 10 }}
+        securityContext:
+          {{- toYaml .Values.deployment.containerSecurityContext | nindent 10 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

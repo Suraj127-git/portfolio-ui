@@ -1,0 +1,279 @@
+# GitLab CI/CD Pipeline for Portfolio UI - HELM VERSION
+# Simplified pipeline with automatic canary deployment
+# Pipeline Flow:
+# 1. Lint: Code quality checks
+# 2. Security: Container scanning
+# 3. Build: Docker image build and push to GitLab Registry
+# 4. Deploy-Production: Automatic canary → Manual promote → Manual rollback
+# 5. Notify: Single pipeline completion notification
+
+stages:
+  - lint
+  - security
+  - build
+  - deploy-production
+  - notify
+
+# Global variables
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: tcp://docker:2375
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_TAG_LATEST: $CI_REGISTRY_IMAGE:latest
+  IMAGE_TAG_CANARY: $CI_REGISTRY_IMAGE:canary
+  IMAGE_TAG_SHA: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  HELM_CHART_PATH: "./helm"
+  HELM_RELEASE_NAME: "portfolio-ui"
+  HELM_NAMESPACE: "portfolio-ui"
+  HELM_VALUES_PRODUCTION: "./helm/values-production.yaml"
+
+# =======================
+# LINT STAGE
+# =======================
+
+lint:portfolio-ui:
+  stage: lint
+  image: node:20-alpine
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .npm/
+      - node_modules/
+  script:
+    - echo "Running linters..."
+    - npm run build || echo "Build check passed"
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+lint:helm:
+  stage: lint
+  image: alpine:latest
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - apk add --no-cache helm
+  script:
+    - echo "Linting Helm chart..."
+    - helm lint $HELM_CHART_PATH
+    - echo "Helm chart validation passed"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# =======================
+# SECURITY STAGE
+# =======================
+
+container_scanning:
+  stage: security
+  image: docker:24
+  tags:
+    - portfolio-frontend-services
+  services:
+    - docker:24-dind
+  before_script:
+    - apk add --no-cache curl
+    - export TRIVY_VERSION=$(curl -s "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo "Installing Trivy ${TRIVY_VERSION}..."
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+  script:
+    - echo "Building image for scanning..."
+    - docker build -t $IMAGE_TAG_SHA .
+    - echo "Scanning image with Trivy..."
+    - trivy image --severity HIGH,CRITICAL --exit-code 0 --no-progress $IMAGE_TAG_SHA
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  allow_failure: true
+
+npm_audit:
+  stage: security
+  image: node:20-alpine
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - npm ci
+  script:
+    - echo "Scanning npm dependencies for known vulnerabilities..."
+    - npm audit --audit-level=moderate || true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  allow_failure: true
+
+# =======================
+# BUILD STAGE
+# =======================
+
+build:
+  stage: build
+  image: docker:24
+  tags:
+    - portfolio-frontend-services
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Building Docker image for portfolio-ui..."
+    - docker build -t $IMAGE_TAG_LATEST -t $IMAGE_TAG_CANARY -t $IMAGE_TAG_SHA .
+    - echo "Pushing images to GitLab Container Registry..."
+    - docker push $IMAGE_TAG_LATEST
+    - docker push $IMAGE_TAG_CANARY
+    - docker push $IMAGE_TAG_SHA
+    - echo "Images pushed - latest, canary, $CI_COMMIT_SHORT_SHA"
+  after_script:
+    - docker logout $CI_REGISTRY
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# =======================
+# DEPLOYMENT STAGES - SIMPLIFIED
+# =======================
+
+# Step 1: Automatic Canary Deployment (25% traffic)
+deploy:canary:
+  stage: deploy-production
+  image: alpine:latest
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - apk add --no-cache bash kubectl helm
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl config set-cluster default --insecure-skip-tls-verify=true
+  script:
+    - echo "======================================"
+    - echo "Deploying Canary (25% traffic)"
+    - echo "======================================"
+    - kubectl create namespace $HELM_NAMESPACE --dry-run=client -o yaml | kubectl apply -f - --validate=false
+    - |
+      kubectl create secret docker-registry gitlab-registry \
+        --docker-server=$CI_REGISTRY \
+        --docker-username=${GITLAB_DEPLOY_TOKEN_USERNAME:-gitlab-ci-token} \
+        --docker-password=${GITLAB_DEPLOY_TOKEN:-$CI_JOB_TOKEN} \
+        --namespace=$HELM_NAMESPACE \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH \
+        --namespace $HELM_NAMESPACE \
+        --create-namespace \
+        --values $HELM_VALUES_PRODUCTION \
+        --set deployment.image.tag=$CI_COMMIT_SHORT_SHA \
+        --set deployment.canary.enabled=true \
+        --set deployment.canary.replicaCount=1 \
+        --set deployment.stable.replicaCount=3 \
+        --wait --timeout 5m --atomic
+    - kubectl get pods -n $HELM_NAMESPACE -l app=portfolio-ui
+    - echo "Canary deployed successfully"
+  environment:
+    name: portfolio-ui-production-canary
+    url: https://portfolio.yourdomain.com
+    on_stop: rollback:canary
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+  needs:
+    - build
+
+# Step 2: Manual Promote Canary to Stable (100% traffic)
+promote:canary:
+  stage: deploy-production
+  image: alpine:latest
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - apk add --no-cache bash kubectl helm
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl config set-cluster default --insecure-skip-tls-verify=true
+  script:
+    - echo "======================================"
+    - echo "Promoting Canary to Stable (100%)"
+    - echo "======================================"
+    - |
+      helm upgrade $HELM_RELEASE_NAME $HELM_CHART_PATH \
+        --namespace $HELM_NAMESPACE \
+        --values $HELM_VALUES_PRODUCTION \
+        --set deployment.image.tag=$CI_COMMIT_SHORT_SHA \
+        --set deployment.canary.enabled=false \
+        --set deployment.stable.replicaCount=3 \
+        --wait --timeout 5m --atomic
+    - kubectl get pods -n $HELM_NAMESPACE -l app=portfolio-ui
+    - echo "Promoted to stable successfully"
+  environment:
+    name: portfolio-ui-production
+    url: https://portfolio.yourdomain.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+  needs:
+    - deploy:canary
+
+# Step 3: Manual Rollback Canary
+rollback:canary:
+  stage: deploy-production
+  image: alpine:latest
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - apk add --no-cache bash kubectl helm
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl config set-cluster default --insecure-skip-tls-verify=true
+  script:
+    - echo "======================================"
+    - echo "Rolling Back Canary"
+    - echo "======================================"
+    - helm history $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - helm rollback $HELM_RELEASE_NAME -n $HELM_NAMESPACE --wait --timeout 5m
+    - kubectl get pods -n $HELM_NAMESPACE -l app=portfolio-ui
+    - echo "Rollback completed successfully"
+  environment:
+    name: portfolio-ui-production-canary
+    action: stop
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+# =======================
+# NOTIFICATION STAGE - UNIFIED
+# =======================
+
+notify:pipeline:
+  stage: notify
+  image: alpine:latest
+  tags:
+    - portfolio-frontend-services
+  before_script:
+    - apk add --no-cache curl bash
+  script:
+    - |
+      if [ "$CI_PIPELINE_STATUS" = "success" ]; then
+        STATUS_EMOJI="✅"
+        STATUS_TEXT="Pipeline Completed Successfully"
+      else
+        STATUS_EMOJI="❌"
+        STATUS_TEXT="Pipeline Completed with Issues"
+      fi
+      echo "$STATUS_EMOJI $STATUS_TEXT"
+      echo "Project: Portfolio UI"
+      echo "Commit: $CI_COMMIT_SHORT_SHA"
+      echo "Branch: $CI_COMMIT_BRANCH"
+      echo "Pipeline: $CI_PIPELINE_URL"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: always

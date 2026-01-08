@@ -1,5 +1,0 @@
-# Serve the site on port 80
-:80 {
-    root * /usr/src/app/dist
-    file_server
-}
